@@ -1,0 +1,11 @@
+extends:
+  - recommended
+
+rules:
+  operation-summary: warn
+  operation-4xx-response: warn
+  security-defined: warn
+  server-not-trailing-slash: off
+  server-not-example-com-or-localhost: off
+  tag-description: warn
+  info-license: warn
