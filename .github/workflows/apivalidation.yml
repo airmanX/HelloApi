@@ -1,4 +1,4 @@
-name: OpenAPI: generate & validate
+name: "OpenAPI: generate & validate"
 
 on:
   pull_request:
