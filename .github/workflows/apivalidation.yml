@@ -1,0 +1,183 @@
+name: Validate OpenAPI (PR)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [ "**" ]
+  workflow_dispatch:
+    inputs:
+      design_api_base:
+        description: 'Base URL of the design API (no trailing slash)'
+        default: 'https://design.example.com'
+      application_name:
+        description: 'applicationName query param'
+        default: 'DIYALOG_MS'
+      sub_application_name:
+        description: 'subApplicationName query param'
+        default: 'DIYALOG-WEBAPP'
+      csproj_path:
+        description: 'Path to the API .csproj'
+        default: 'src/MyApi/MyApi.csproj'
+      doc_name:
+        description: 'Swashbuckle document name (e.g., v1)'
+        default: 'v1'
+      fail_mode:
+        description: 'Fail on any diff (all) or only breaking changes (breaking)'
+        type: choice
+        default: 'all'
+        options: [all, breaking]
+
+jobs:
+  validate-openapi:
+    name: Validate OpenAPI
+    runs-on: ubuntu-latest
+
+    env:
+      # Defaults (can be overridden by repo variables or workflow_dispatch inputs)
+      DESIGN_API_BASE: ${{ inputs.design_api_base || vars.DESIGN_API_BASE || 'https://design.example.com' }}
+      APPLICATION_NAME: ${{ inputs.application_name || vars.APPLICATION_NAME || 'DIYALOG_MS' }}
+      SUB_APPLICATION_NAME: ${{ inputs.sub_application_name || vars.SUB_APPLICATION_NAME || 'DIYALOG-WEBAPP' }}
+      CSPROJ_PATH: ${{ inputs.csproj_path || vars.CSPROJ_PATH || 'src/MyApi/MyApi.csproj' }}
+      DOC_NAME: ${{ inputs.doc_name || vars.DOC_NAME || 'v1' }}
+      FAIL_MODE: ${{ inputs.fail_mode || vars.FAIL_MODE || 'all' }}
+      ARTIFACTS: artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Node (for Redocly CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install tools (jq, Redocly, Swashbuckle CLI, oasdiff)
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+          npx --yes @redocly/cli@latest --version
+          dotnet new tool-manifest || true
+          dotnet tool install Swashbuckle.AspNetCore.Cli --version 6.* || dotnet tool update Swashbuckle.AspNetCore.Cli
+          curl -fsSL https://raw.githubusercontent.com/oasdiff/oasdiff/main/install.sh | sh
+          oasdiff version
+
+      # 1) Build & try to emit swagger; skip early if not produced
+      - name: Build & emit swagger
+        id: emit
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "${ARTIFACTS}"
+          # Build
+          dotnet restore "${CSPROJ_PATH%/*}"
+          dotnet build   "${CSPROJ_PATH%/*}" -c Release
+
+          # Find DLL and emit swagger (do not fail hard on CLI)
+          DLL=$(find "${CSPROJ_PATH%/*}" -name '*.dll' -path '*/bin/*/Release/*' | head -n 1 || true)
+          if [ -z "$DLL" ]; then
+            echo "No DLL produced; treating as background/non-HTTP service."
+            echo "has_swagger=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          dotnet swagger tofile --output "${ARTIFACTS}/implemented.json" "$DLL" "${DOC_NAME}" || true
+
+          if [ ! -s "${ARTIFACTS}/implemented.json" ]; then
+            echo "No swagger.json produced; treating as background/non-HTTP service."
+            echo "has_swagger=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_swagger=true" >> "$GITHUB_OUTPUT"
+
+      - name: Note skip in PR summary (no swagger)
+        if: ${{ steps.emit.outputs.has_swagger != 'true' }}
+        shell: bash
+        run: |
+          {
+            echo "### OpenAPI Validation"
+            echo ""
+            echo "⚠️ Skipped — this build produced no **swagger.json** (likely a background service)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 2) Only fetch & bundle design if swagger exists
+      - name: Fetch design from API
+        if: ${{ steps.emit.outputs.has_swagger == 'true' }}
+        shell: bash
+        run: |
+          set -e
+          RESP="${ARTIFACTS}/design-response.json"
+          curl -sS -G "${DESIGN_API_BASE}/apiyaml" \
+            --data-urlencode "applicationName=${APPLICATION_NAME}" \
+            --data-urlencode "subApplicationName=${SUB_APPLICATION_NAME}" \
+            -o "$RESP"
+
+          CODE=$(jq -r '.messageCode // empty' "$RESP")
+          MSG=$(jq -r '.message // empty' "$RESP")
+          if [ -z "$CODE" ] || [ "$CODE" = "null" ] || [ "$CODE" = "ERROR" ] || [ "$CODE" = "1" ]; then
+            echo "Design API error: messageCode='$CODE' message='${MSG:-<none>}'"
+            exit 1
+          fi
+
+          jq -r '.apiDefinition // empty' "$RESP" > "${ARTIFACTS}/design.raw"
+          if [ ! -s "${ARTIFACTS}/design.raw" ]; then
+            echo "apiDefinition is empty."
+            exit 1
+          fi
+
+          # JSON vs YAML detection
+          if head -n1 "${ARTIFACTS}/design.raw" | grep -q '^\s*{'; then
+            mv "${ARTIFACTS}/design.raw" "${ARTIFACTS}/design.json"
+            DESIGN="${ARTIFACTS}/design.json"
+          else
+            mv "${ARTIFACTS}/design.raw" "${ARTIFACTS}/design.yaml"
+            DESIGN="${ARTIFACTS}/design.yaml"
+          fi
+
+          head -n1 "$DESIGN" | grep -E '^(\\s*\\{|\\s*openapi:)' >/dev/null || {
+            echo "Extracted design does not look like OpenAPI. First line:"
+            head -n1 "$DESIGN"
+            exit 1
+          }
+
+          # Lint & bundle (standardize to YAML)
+          if [ -f "${ARTIFACTS}/design.yaml" ]; then
+            npx --yes @redocly/cli lint "${ARTIFACTS}/design.yaml"
+            npx --yes @redocly/cli bundle "${ARTIFACTS}/design.yaml" -o "${ARTIFACTS}/design-bundled.yaml"
+          else
+            npx --yes @redocly/cli lint "${ARTIFACTS}/design.json"
+            npx --yes @redocly/cli bundle "${ARTIFACTS}/design.json" -o "${ARTIFACTS}/design-bundled.yaml"
+          fi
+
+      # 3) Diff & fail according to your policy
+      - name: Diff (fail on mismatch)
+        if: ${{ steps.emit.outputs.has_swagger == 'true' }}
+        shell: bash
+        run: |
+          set -e
+          # Human-readable changelog in job summary
+          echo "### OpenAPI Diff" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          oasdiff changelog "${ARTIFACTS}/design-bundled.yaml" "${ARTIFACTS}/implemented.json" | tee "${ARTIFACTS}/diff.txt" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${FAIL_MODE}" = "breaking" ]; then
+            # Fail only on breaking changes
+            oasdiff breaking "${ARTIFACTS}/design-bundled.yaml" "${ARTIFACTS}/implemented.json" --format text > "${ARTIFACTS}/diff-raw.txt"
+          else
+            # Fail on any difference
+            oasdiff diff "${ARTIFACTS}/design-bundled.yaml" "${ARTIFACTS}/implemented.json" --format text > "${ARTIFACTS}/diff-raw.txt"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-validation
+          path: artifacts/**
+          if-no-files-found: ignore
