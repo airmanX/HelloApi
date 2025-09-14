@@ -38,30 +38,37 @@ jobs:
       - name: Build
         run: dotnet build "${{ env.PROJECT_PATH }}" -c "${{ env.CONFIGURATION }}" --no-restore
 
-      - name: Generate Swagger (no server)
+      - name: Generate Swagger (no server) — local tool
         id: genswagger
         shell: bash
         run: |
-          set -euo pipefail
-          # Install Swashbuckle CLI (dotnet global tool)
-          dotnet tool install -g Swashbuckle.AspNetCore.Cli >/dev/null 2>&1 || true
-          export PATH="$PATH:$HOME/.dotnet/tools"
+         set -euo pipefail
 
-          # Resolve the built DLL path dynamically (no hardcoded TFM)
-          TARGET_DLL=$(dotnet msbuild "${{ env.PROJECT_PATH }}" -nologo -getProperty:TargetPath)
-          echo "Using DLL: $TARGET_DLL"
+         # 1) Create a local tool manifest for this repo and pin the CLI version
+         dotnet new tool-manifest --force
+         dotnet tool install Swashbuckle.AspNetCore.Cli --version 9.0.4
 
-          mkdir -p "$(dirname "${{ env.SWAGGER_OUT }}")"
+         # (Optional but useful) show installed tools
+         dotnet tool list
 
-          # Generate swagger.json from the compiled assembly
-          ASPNETCORE_ENVIRONMENT=CI dotnet swagger tofile \
-            --output "${{ env.SWAGGER_OUT }}" \
-            "$TARGET_DLL" \
-            "${{ env.SWAGGER_DOC }}"
+         # 2) Resolve the built DLL path dynamically (no hardcoded TFM)
+         TARGET_DLL=$(dotnet msbuild "${{ env.PROJECT_PATH }}" -nologo -getProperty:TargetPath)
+         echo "Using DLL: $TARGET_DLL"
 
-          BYTES=$(wc -c < "${{ env.SWAGGER_OUT }}")
-          echo "bytes=$BYTES" >> "$GITHUB_OUTPUT"
-          echo "Generated $BYTES bytes at ${{ env.SWAGGER_OUT }}"
+         mkdir -p "$(dirname "${{ env.SWAGGER_OUT }}")"
+
+         # 3) Run the CLI via 'tool run'. Add roll-forward to avoid runtime mismatches.
+         DOTNET_ROLL_FORWARD=LatestMajor \
+         ASPNETCORE_ENVIRONMENT=CI \
+         dotnet tool run swagger tofile \
+         --output "${{ env.SWAGGER_OUT }}" \
+         "$TARGET_DLL" \
+         "${{ env.SWAGGER_DOC }}"
+
+         BYTES=$(wc -c < "${{ env.SWAGGER_OUT }}")
+         echo "bytes=$BYTES" >> "$GITHUB_OUTPUT"
+         echo "Generated $BYTES bytes at ${{ env.SWAGGER_OUT }}"
+
 
       - name: Validate design syntax (swagger-cli)
         uses: mbowman100/swagger-validator-action@2.0
