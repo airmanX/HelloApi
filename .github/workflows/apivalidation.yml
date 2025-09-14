@@ -73,7 +73,7 @@ jobs:
       - name: Validate design with Redocly (supports 3.0.4/3.1)
         uses: fluximus-prime/redocly-cli-github-action@v1
         with:
-          files: '${{ env.DESIGN_FILE }}'
+          args: 'lint ${{ env.DESIGN_FILE }} --format=github-actions'
 
       - name: Lint design with Spectral (optional)
         continue-on-error: true
